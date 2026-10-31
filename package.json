@@ -1,0 +1,56 @@
+{
+  "name": "lmt",
+  "description": "Libre Manga Translator - Free Privacy-focused AI manga translation extension, you decide where your data goes.",
+  "private": true,
+  "version": "1.0.3",
+  "license": "AGPL-3.0-or-later",
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "dev:firefox": "wxt -b firefox",
+    "build": "wxt build",
+    "build:firefox": "wxt build -b firefox",
+    "zip": "wxt zip",
+    "zip:firefox": "wxt zip -b firefox",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "check:inpaint": "bun scripts/inpaint-selfcheck.ts",
+    "check:gate": "bun scripts/gate-selfcheck.ts",
+    "check:hashes": "bun scripts/hashes-selfcheck.ts",
+    "check:ocr": "bun scripts/ocr-selfcheck.ts",
+    "check:security": "bun scripts/security-selfcheck.ts",
+    "check:validator": "bun scripts/validator-selfcheck.ts",
+    "check:ocr-packs": "bun scripts/ocr-lang-packs-selfcheck.ts",
+    "check:ocr-audit": "bun scripts/ocr-runtime-audit.ts",
+    "test:unit": "bun test tests/unit/",
+    "test:e2e": "playwright test",
+    "mock:llm": "bun scripts/lmt-mock-server.ts",
+    "test": "bun run test:unit && bun run test:e2e",
+    "prepublish:check": "bun run check && bun run check:ocr-audit && bun run test:unit && bun run build && bun run test:e2e && bun run build:firefox",
+    "extract-dict": "node scripts/extract-ppocrv6-dict.cjs",
+    "pin:hashes": "bun scripts/pin-model-hashes.ts",
+    "postinstall": "wxt prepare"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@tailwindcss/vite": "^4.1.18",
+    "@tsconfig/svelte": "^5.0.7",
+    "@types/bun": "^1.4.2",
+    "@wxt-dev/module-svelte": "2.0.3",
+    "svelte": "^5.38.6",
+    "svelte-check": "^4.3.1",
+    "tailwindcss": "^4.1.18",
+    "terser": "^5.46.0",
+    "tslib": "^2.8.1",
+    "typescript": "^5.9.2",
+    "wxt": "0.20.11"
+  },
+  "dependencies": {
+    "@mlc-ai/web-llm": "^0.2.86",
+    "lucide-svelte": "^0.563.0",
+    "onnxruntime-web": "^1.30.0"
+  },
+  "trustedDependencies": [
+    "protobufjs",
+    "spawn-sync"
+  ]
+}

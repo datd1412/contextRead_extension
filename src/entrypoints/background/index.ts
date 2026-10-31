@@ -1,0 +1,1107 @@
+import { env } from "@/lib/env";
+import { downloadArtifactHF, arrayBufferToBase64DataUrl, isArtifactCached, streamArtifactToCache, resolveArtifactUrl, isAbortError, clearPartialByUrl, clearAllPartialDownloads } from "@/lib/utils";
+import { checkArtifactUpdate, forceRefreshArtifact } from "@/lib/models/updates";
+import { detectHardware, ensureOffscreen } from "./utils";
+import { DefaultConfig, SUPPORTED_LANG_GROUPS, normalizeDetectionModel, resolveLangGroup } from "@/lib/configs";
+import { UNKNOWN_DETECTION_MODEL_MESSAGE } from "@/lib/detections/main";
+import { testServerConnection } from "@/lib/server/main";
+import { createAsyncResponder, keepAliveWhile, withTimeout } from "./messaging";
+import { isAllowedImageUrl } from "@/lib/security";
+
+/**
+ * Parse a VRAM label like "~800 MB" / "3.4 GB" into bytes for display.
+ * Unknown format → 0 (formatter renders "0 B", never a wrong size).
+ */
+function parseVramToBytes(vram: string | undefined): number {
+  if (!vram) return 0;
+  const m = vram.match(/([\d.]+)\s*(MB|GB)/i);
+  if (!m) return 0;
+  const n = parseFloat(m[1]);
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n * (m[2].toUpperCase() === "GB" ? 1024 ** 3 : 1024 ** 2));
+}
+
+export default defineBackground(() => {
+  // ── Unified backend limiter ──────────────────────────────────────────
+  // One counting semaphore shared by all pipeline backends (webgpu /
+  // gemini / api) and all heavy stages (detect, translate, inpaint), so
+  // auto + manual jobs across every tab can never burst past the cap.
+  // Cap rule mirrors the content queue: slider 1..10 when auto is ON,
+  // absolute 3 when OFF. Read per-acquire so mid-queue mode/pipeline
+  // swaps keep working without resetting the queue.
+  // ponytail: in-memory only, lost on SW kill; keepAliveWhile covers
+  // active work and stalled waiters surface via withTimeout → markIdle.
+  const MANUAL_BACKEND_CAP = 3;
+  let backendActive = 0;
+  const backendWaiters: Array<() => void> = [];
+
+  async function getBackendCap(): Promise<number> {
+    try {
+      const [enabled, slider] = await Promise.all([
+        storage.getItem<boolean>("sync:auto-translate"),
+        storage.getItem<number>("sync:auto-translate-concurrency"),
+      ]);
+      if (enabled) return Math.min(10, Math.max(1, Math.trunc(slider as number) || 1));
+      return MANUAL_BACKEND_CAP;
+    } catch {
+      return 1;
+    }
+  }
+
+  function pumpBackendQueue(cap: number) {
+    while (backendActive < cap && backendWaiters.length > 0) {
+      backendActive++;
+      backendWaiters.shift()!();
+    }
+  }
+
+  async function acquireBackendSlot(): Promise<() => void> {
+    const cap = await getBackendCap();
+    // Check + increment is synchronous past this await, so concurrent
+    // acquirers serialize here without over-issuing.
+    if (backendActive < cap) {
+      backendActive++;
+      return () => {
+        backendActive--;
+        void getBackendCap().then(pumpBackendQueue);
+      };
+    }
+    return new Promise<() => void>((resolve) => {
+      backendWaiters.push(() => {
+        resolve(() => {
+          backendActive--;
+          void getBackendCap().then(pumpBackendQueue);
+        });
+      });
+      // Cap may have grown while waiting with no release in flight — pump.
+      void getBackendCap().then(pumpBackendQueue);
+    });
+  }
+
+  // Cap increase with an idle backend and full waiter list otherwise waits
+  // for a release that may never come — pump on config change.
+  storage.watch<boolean>("sync:auto-translate", () => {
+    void getBackendCap().then(pumpBackendQueue);
+  });
+  storage.watch<number>("sync:auto-translate-concurrency", () => {
+    void getBackendCap().then(pumpBackendQueue);
+  });
+
+  // ── Central resumable download manager ─────────────────────────────
+  // Single owner for every ONNX weight download (setup wizard, popup
+  // Config, sidebar Vision) so Pause in one UI can Resume in another.
+  // Partial chunks live in this worker's heap (utils partial store, keyed
+  // by resolved URL); progress goes out as MODEL_DOWNLOAD_PROGRESS
+  // broadcasts. Latest click wins: starting a new job auto-pauses the
+  // active one (partial kept, resumable). A killed worker loses partials —
+  // resume then restarts the file from byte 0, which is safe (short
+  // streams are never cached) but never corrupt.
+  type ManagedJobStatus = "downloading" | "paused" | "done" | "error";
+  interface ManagedJobFile {
+    repo: string;
+    path: string;
+    label?: string;
+  }
+  interface ManagedJob {
+    key: string;
+    files: ManagedJobFile[];
+    fileIndex: number;
+    status: ManagedJobStatus;
+    loaded: number;
+    total: number;
+    error: string | null;
+    controller: AbortController | null;
+    lastEmit: number;
+    dead: boolean;
+  }
+  const managedJobs = new Map<string, ManagedJob>();
+  let managedActiveKey: string | null = null;
+
+  const ABORTED = () => new DOMException("Download aborted", "AbortError");
+
+  function managedSnapshot(job: ManagedJob) {
+    const frac =
+      job.files.length === 0
+        ? 1
+        : Math.min(
+            1,
+            (job.fileIndex + (job.total > 0 ? job.loaded / job.total : 0)) /
+              job.files.length,
+          );
+    const at = Math.min(job.fileIndex, Math.max(0, job.files.length - 1));
+    return {
+      key: job.key,
+      status: job.status,
+      fraction: job.status === "done" ? 1 : frac,
+      loaded: job.loaded,
+      total: job.total,
+      fileIndex: at,
+      fileCount: job.files.length,
+      fileLabel: job.files[at]?.label ?? "",
+      error: job.error,
+    };
+  }
+
+  function emitManaged(job: ManagedJob, force = false) {
+    const now = Date.now();
+    if (!force && now - job.lastEmit < 250) return;
+    job.lastEmit = now;
+    const payload = managedSnapshot(job);
+    try {
+      browser.runtime
+        .sendMessage({ type: "MODEL_DOWNLOAD_PROGRESS", payload })
+        .catch(() => {});
+    } catch {}
+    // runtime.sendMessage never reaches content scripts (sidebar lives in
+    // the page context) — fan out explicitly so it ticks live too.
+    fanOutToTabs({ type: "MODEL_DOWNLOAD_PROGRESS", payload });
+  }
+
+  function fanOutToTabs(message: unknown) {
+    try {
+      browser.tabs
+        .query({})
+        .then((tabs) => {
+          for (const t of tabs) {
+            if (t.id === undefined) continue;
+            browser.tabs.sendMessage(t.id, message).catch(() => {});
+          }
+        })
+        .catch(() => {});
+    } catch {}
+  }
+
+  function emitManagedIdle(key: string, fileCount: number) {
+    const payload = { key, status: "idle", fraction: 0, loaded: 0, total: 0, fileIndex: 0, fileCount, fileLabel: "", error: null };
+    try {
+      browser.runtime
+        .sendMessage({
+          type: "MODEL_DOWNLOAD_PROGRESS",
+          payload,
+        })
+        .catch(() => {});
+    } catch {}
+    fanOutToTabs({ type: "MODEL_DOWNLOAD_PROGRESS", payload });
+  }
+
+  function pauseManagedJob(key: string) {
+    const job = managedJobs.get(key);
+    if (!job || job.dead || job.status !== "downloading") return;
+    job.status = "paused";
+    try {
+      job.controller?.abort();
+    } catch {}
+    if (managedActiveKey === key) managedActiveKey = null;
+    emitManaged(job, true);
+  }
+
+  function discardManagedJob(key: string) {
+    const job = managedJobs.get(key);
+    if (!job) return;
+    job.dead = true;
+    try {
+      job.controller?.abort();
+    } catch {}
+    for (const f of job.files) {
+      try {
+        clearPartialByUrl(resolveArtifactUrl(f.repo, f.path).url);
+      } catch {}
+    }
+    managedJobs.delete(key);
+    if (managedActiveKey === key) managedActiveKey = null;
+    emitManagedIdle(key, job.files.length);
+  }
+
+  /** Rewind jobs touching a deleted URL so resume re-fetches it from byte 0. */
+  function rewindManagedJobsForUrl(url: string) {
+    clearPartialByUrl(url);
+    for (const job of managedJobs.values()) {
+      if (job.dead) continue;
+      const idx = job.files.findIndex((f) => {
+        try {
+          return resolveArtifactUrl(f.repo, f.path).url === url;
+        } catch {
+          return false;
+        }
+      });
+      if (idx === -1) continue;
+      if (idx < job.fileIndex) job.fileIndex = idx;
+      if (job.status === "downloading") {
+        pauseManagedJob(job.key);
+      } else if (job.status === "done") {
+        // Cached set is no longer complete — back to resumable.
+        job.status = "paused";
+        emitManaged(job, true);
+      } else {
+        emitManaged(job, true);
+      }
+    }
+  }
+
+  async function runManagedJob(job: ManagedJob): Promise<void> {
+    job.status = "downloading";
+    job.error = null;
+    managedActiveKey = job.key;
+    emitManaged(job, true);
+    try {
+      for (; job.fileIndex < job.files.length; job.fileIndex++) {
+        if (job.dead || job.status !== "downloading") throw ABORTED();
+        const f = job.files[job.fileIndex];
+        const { url, cacheName } = resolveArtifactUrl(f.repo, f.path);
+        job.loaded = 0;
+        job.total = 0;
+        // Files finished in this or an earlier run skip instantly.
+        try {
+          if (await isArtifactCached(f.repo, f.path)) continue;
+        } catch {}
+        job.controller = new AbortController();
+        if (job.dead || job.status !== "downloading") throw ABORTED();
+        await streamArtifactToCache(url, cacheName, {
+          signal: job.controller.signal,
+          onProgress: (loaded, total) => {
+            job.loaded = loaded;
+            job.total = total;
+            emitManaged(job);
+          },
+        });
+      }
+      job.status = "done";
+      job.loaded = job.total;
+      emitManaged(job, true);
+    } catch (err) {
+      if (job.dead) return;
+      if (isAbortError(err)) {
+        // Pause path already set status + emitted; a superseded run
+        // (latest-wins) lands here as paused.
+        if (job.status === "downloading") {
+          job.status = "paused";
+          emitManaged(job, true);
+        }
+        return;
+      }
+      job.status = "error";
+      job.error = (err as Error)?.message ?? String(err);
+      emitManaged(job, true);
+    } finally {
+      job.controller = null;
+      if (managedActiveKey === job.key) managedActiveKey = null;
+    }
+  }
+
+  async function startManagedJob(
+    key: string,
+    files: ManagedJobFile[],
+  ): Promise<ReturnType<typeof managedSnapshot>> {
+    let job = managedJobs.get(key);
+    const sameFiles =
+      !!job &&
+      job.files.length === files.length &&
+      job.files.every((f, i) => f.repo === files[i]?.repo && f.path === files[i]?.path);
+    if (!job || !sameFiles) {
+      if (job) discardManagedJob(key);
+      job = {
+        key,
+        files,
+        fileIndex: 0,
+        status: "paused",
+        loaded: 0,
+        total: 0,
+        error: null,
+        controller: null,
+        lastEmit: 0,
+        dead: false,
+      };
+      managedJobs.set(key, job);
+    }
+    if (job.status === "downloading") return managedSnapshot(job);
+    // Not downloading: rewind to the first cache-missing file so a job
+    // whose weights were deleted (or never finished) resumes correctly.
+    // A fully cached job reports done without touching the network.
+    for (let i = 0; i < job.files.length; i++) {
+      let cached = false;
+      try {
+        cached = await isArtifactCached(job.files[i].repo, job.files[i].path);
+      } catch {}
+      if (!cached) {
+        job.fileIndex = i;
+        break;
+      }
+      if (i === job.files.length - 1) {
+        job.status = "done";
+        job.loaded = job.total;
+        emitManaged(job, true);
+        return managedSnapshot(job);
+      }
+    }
+    // Latest click wins: auto-pause whatever else is downloading.
+    if (managedActiveKey && managedActiveKey !== key) pauseManagedJob(managedActiveKey);
+    job.error = null;
+    const run = runManagedJob(job);
+    keepAliveWhile(run.catch(() => {}));
+    return managedSnapshot(job);
+  }
+
+  async function openSetupTabInBackground(modelId?: string, clean?: boolean) {
+    let targetUrl = browser.runtime.getURL("/setup.html");
+    if (modelId) {
+      targetUrl += `?model=${modelId}`;
+    }
+    if (clean) {
+      targetUrl += `${modelId ? "&" : "?"}clean=1`;
+    }
+
+    // Check if any tab is already open with the setup page
+    const existingTabs = await browser.tabs.query({
+      url: browser.runtime.getURL("/setup.html") + "*",
+    });
+
+    if (existingTabs.length > 0) {
+      const tab = existingTabs[0];
+
+      await browser.tabs.update(tab.id, {
+        active: true,
+        ...(targetUrl.includes("?") ? { url: targetUrl } : {}),
+      });
+
+      await browser.windows.update(tab.windowId, { focused: true });
+    } else {
+      await browser.tabs.create({ url: targetUrl });
+    }
+  }
+
+  browser.runtime.onInstalled.addListener(async (details) => {
+    await storage.setItem("local:active-device", await detectHardware());
+    if (details.reason === "install") {
+      openSetupTabInBackground();
+    }
+  });
+
+  browser.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+    const respond = createAsyncResponder(sendResponse);
+    const respondErr = (err: unknown) =>
+      respond({ error: (err as Error).message ?? String(err) });
+
+    if (msg.type === "CAPTURE_VISIBLE_TAB") {
+      const task = async () => {
+        const windowId = sender.tab?.windowId ?? browser.windows.WINDOW_ID_CURRENT;
+        const dataUrl = await browser.tabs.captureVisibleTab(windowId, {
+          format: "png",
+        });
+        return { dataUrl };
+      };
+      keepAliveWhile(task().then(respond).catch(respondErr));
+      return true;
+    }
+
+    // Proxy image fetch for cross-origin or hotlink-protected images (Cloudflare, Referer checks).
+    // Uses declarativeNetRequest to inject the proper Referer so CDNs accept the request,
+    // then converts to base64 data URL to completely bypass CORS/network downstream.
+    if (msg.type === "PROXY_IMAGE") {
+      const { url, referer } = msg.data ?? {};
+      if (!url || !isAllowedImageUrl(url, referer)) {
+        respondErr(new Error("Security rejection: Disallowed or unsafe image URL"));
+        return true;
+      }
+      const task = async () => {
+        const ruleId = 99999;
+        const dnr = (browser as any).declarativeNetRequest;
+        if (dnr?.updateSessionRules && referer) {
+          try {
+            await dnr.updateSessionRules({
+              removeRuleIds: [ruleId],
+              addRules: [
+                {
+                  id: ruleId,
+                  priority: 1,
+                  action: {
+                    type: "modifyHeaders",
+                    requestHeaders: [
+                      {
+                        header: "Referer",
+                        operation: "set",
+                        value: referer,
+                      },
+                    ],
+                  },
+                  condition: {
+                    urlFilter: url.replace(/[?#].*$/, ""),
+                    resourceTypes: [
+                      "xmlhttprequest",
+                      "other",
+                      "image",
+                    ],
+                  },
+                },
+              ],
+            });
+          } catch (e) {
+            console.warn("LMT: Failed to set DNR rule for proxy fetch:", e);
+          }
+        }
+
+        try {
+          const res = await fetch(url);
+          if (!res.ok) {
+            throw new Error(
+              `Proxy fetch failed with status ${res.status}: ${res.statusText}`,
+            );
+          }
+          const buf = await res.arrayBuffer();
+          return { dataUrl: await arrayBufferToBase64DataUrl(buf) };
+        } finally {
+          if (dnr?.updateSessionRules && referer) {
+            await dnr
+              .updateSessionRules({
+                removeRuleIds: [ruleId],
+              })
+              .catch(() => {});
+          }
+        }
+      };
+
+      keepAliveWhile(task().then(respond).catch(respondErr));
+
+      return true;
+    }
+
+    // Forwarding heavy inference to the offscreen document.
+    // Serialized through the unified backend semaphore: queued jobs wait
+    // for a slot BEFORE the execution timeout starts, so queue wait never
+    // consumes the per-job budget.
+    if (
+      ["DETECT_BBOX", "TRANSLATE_IMAGE", "MAKE_SITE_RULE_AI", "INPAINT_IMAGE"].includes(
+        msg.type,
+      )
+    ) {
+      // Quality (LaMa) runs on wasm CPU (~30s+ per 512px tile), so a Quality
+      // inpaint over N regions needs a per-region budget, not a flat page budget.
+      const inpaintBoxes = Array.isArray(msg.data?.bboxes)
+        ? msg.data.bboxes.length
+        : 0;
+      const isLocalTranslate =
+        msg.type === "TRANSLATE_IMAGE" &&
+        (msg.config?.currentMode === "webgpu" || !msg.config?.currentMode);
+      const timeoutMs =
+        msg.type === "INPAINT_IMAGE" && msg.data?.method === "quality"
+          ? Math.max(300_000, inpaintBoxes * 60_000)
+          : isLocalTranslate
+            ? 480_000
+          : msg.type === "TRANSLATE_IMAGE" || msg.type === "INPAINT_IMAGE"
+            ? 180_000
+            : 90_000;
+
+      const forward = () =>
+        browser.runtime.sendMessage({
+          ...msg,
+          type: `OFFSCREEN_${msg.type}`,
+        });
+
+      const run = async () => {
+        const release = await acquireBackendSlot();
+        try {
+          return await withTimeout(
+            ensureOffscreen()
+              .then(forward)
+              .catch(async () => {
+                // Offscreen may be dead (e.g. CSP crash) - recreate and retry once.
+                await browser.offscreen.closeDocument().catch(() => {});
+                await ensureOffscreen();
+                return forward();
+              }),
+            timeoutMs,
+            msg.type,
+          );
+        } finally {
+          release();
+        }
+      };
+
+      keepAliveWhile(run().then(respond).catch(respondErr));
+
+      return true;
+    }
+
+    // Open/reuse the setup page from any context (content script, popup)
+    if (msg.type === "OPEN_SETUP_TAB") {
+      keepAliveWhile(
+        openSetupTabInBackground(msg.data?.modelId, msg.data?.clean)
+          .then(() => respond({ success: true }))
+          .catch(respondErr),
+      );
+
+      return true;
+    }
+
+    // Test a site rule regex against the active tab
+    if (msg.type === "TEST_SITE_RULE") {
+      const run = async () => {
+        const tabs = await browser.tabs.query({
+          active: true,
+          currentWindow: true,
+        });
+        if (tabs[0]?.id) {
+          return browser.tabs.sendMessage(tabs[0].id, {
+            type: "TEST_REGEX_RULE",
+            data: { rule: msg.data?.rule },
+          });
+        }
+        return { error: "No active tab." };
+      };
+
+      keepAliveWhile(run().then(respond).catch(respondErr));
+
+      return true;
+    }
+
+    // Enumerate all downloaded models (CacheStorage + WebLLM)
+    if (msg.type === "LIST_CACHED_MODELS") {
+      const task = async () => {
+        const results: {
+          id: string;
+          name: string;
+          category: "LLM" | "Detection" | "OCR" | "Inpaint" | "Script Gate" | "Other";
+          size: number;
+          cacheName: string;
+          url: string;
+          isLlm: boolean;
+        }[] = [];
+
+        // 1. Enumerate CacheStorage entries
+        try {
+          const cacheNames = await caches.keys();
+          for (const cacheName of cacheNames) {
+            const cache = await caches.open(cacheName);
+            // Snapshot keys once. Invalid entries are collected here and
+            // deleted in a single pass after the scan — never mutate the
+            // cache while iterating it (delete() used to run inside this
+            // loop, racing the trailing empty-cache check).
+            const requests = await cache.keys();
+            const toDelete: Request[] = [];
+            let survivors = 0;
+            for (const req of requests) {
+              const url = req.url;
+              let size = 0;
+              let valid: boolean;
+              try {
+                const resp = await cache.match(req);
+                if (!resp || !resp.ok) {
+                  valid = false;
+                } else {
+                  const blob = await resp.blob();
+                  size = blob?.size ?? 0;
+                  // < 1 KB is never a valid model weight (0-byte/aborted entry).
+                  valid = size > 1024;
+                }
+              } catch {
+                valid = false;
+              }
+
+              if (!valid) {
+                toDelete.push(req);
+                continue;
+              }
+              survivors++;
+
+              let category: "Detection" | "OCR" | "Inpaint" | "Script Gate" | "Other" = "Other";
+              let name = url.split("/").pop() ?? url;
+
+              if (url.includes("lama-manga") || cacheName.includes("lama-manga")) {
+                category = "Inpaint";
+                name = "LaMa Redraw Model (lama-manga-dynamic.onnx)";
+              } else if (url.includes("comictextdetector")) {
+                category = "Detection";
+                name = "ComicTextDetector (comictextdetector.pt.onnx)";
+              } else if (url.includes("comic-text-and-bubble") || url.includes("detector-v4")) {
+                category = "Detection";
+                name = "RT-DETR Bubble Detector (detector-v4-s_int8.onnx)";
+              } else if (url.includes("manga-ocr") || cacheName.includes("manga-ocr")) {
+                category = "OCR";
+                name = `Manga-OCR (${url.split("/").pop()})`;
+              } else if (url.toLowerCase().includes("ppocr") || cacheName.toLowerCase().includes("ppocr")) {
+                category = "OCR";
+                name = `PP-OCRv6 Manga (${url.split("/").pop()})`;
+              } else if (url.includes("pororo") || cacheName.includes("pororo") || url.includes("brainocr")) {
+                category = "OCR";
+                name = `Pororo OCR (${url.split("/").pop()})`;
+              } else if (url.includes("paddleocr") || url.includes("languages/")) {
+                category = "OCR";
+                name = `PaddleOCR (${url.split("/").pop()})`;
+              } else if (url.includes("osd_lstm") || url.includes("osd_labels")) {
+                category = "Script Gate";
+                name = `Script Gate (${url.split("/").pop()})`;
+              }
+
+              results.push({
+                id: `${cacheName}::${url}`,
+                name,
+                category,
+                size,
+                cacheName,
+                url,
+                isLlm: false,
+              });
+            }
+
+            // Single delete pass. The cache itself is dropped only when the
+            // scan found zero survivors — no post-mutation re-read of keys().
+            for (const req of toDelete) {
+              await cache.delete(req).catch(() => {});
+            }
+            if (survivors === 0) {
+              await caches.delete(cacheName).catch(() => {});
+            }
+          }
+        } catch (e) {
+          console.warn("Failed to enumerate CacheStorage:", e);
+        }
+
+        // 2. Enumerate WebLLM cached models from local storage
+        try {
+          const items = await storage.getItems(["local:cached-llms"]);
+          const cachedLlms = (items[0]?.value as string[]) || [];
+          for (const modelId of cachedLlms) {
+            const foundDef = DefaultConfig.llmModels.find((m) => m.id === modelId);
+            results.push({
+              id: `llm::${modelId}`,
+              name: foundDef ? `${foundDef.label} (${modelId})` : modelId,
+              category: "LLM",
+              size: parseVramToBytes(foundDef?.vram),
+              cacheName: "webllm",
+              url: modelId,
+              isLlm: true,
+            });
+          }
+        } catch (e) {
+          console.warn("Failed to enumerate WebLLM cached models:", e);
+        }
+
+        return results;
+      };
+
+      keepAliveWhile(task().then(respond).catch(respondErr));
+      return true;
+    }
+
+    // Probe extension-side CacheStorage (service worker partition).
+    // Content-world callers (sidebar/overlay shadow UIs) cannot see this
+    // partition directly — each browsing context gets its own CacheStorage.
+    if (msg.type === "IS_MODEL_CACHED") {
+      const task = async () => {
+        const entries: { repo: string; path: string }[] = Array.isArray(msg.data?.entries)
+          ? msg.data.entries
+          : [];
+        const results = await Promise.all(
+          entries.map(async (e) => {
+            try {
+              return await isArtifactCached(e.repo, e.path);
+            } catch {
+              return false;
+            }
+          }),
+        );
+        return { results };
+      };
+
+      keepAliveWhile(task().then(respond).catch(respondErr));
+      return true;
+    }
+
+    // HEAD-compare each non-LLM cached artifact against remote, one-by-one.
+    // Same `x-repo-commit || etag` protocol the old per-model autoUpdate used.
+    if (msg.type === "CHECK_MODEL_UPDATES") {
+      const task = async () => {
+        const cacheNames = await caches.keys();
+        const updates: { cacheName: string; url: string }[] = [];
+        const skipped: string[] = [];
+        let checked = 0;
+        for (const cacheName of cacheNames) {
+          const cache = await caches.open(cacheName);
+          const requests = await cache.keys();
+          for (const req of requests) {
+            const url = req.url;
+            try {
+              const resp = await cache.match(req);
+              if (!resp || !resp.ok) continue;
+              const blob = await resp.blob();
+              if ((blob?.size ?? 0) <= 1024) continue;
+            } catch {
+              continue;
+            }
+            checked++;
+            const { hasUpdate, skipped: wasSkipped } = await checkArtifactUpdate(cacheName, url);
+            if (hasUpdate) updates.push({ cacheName, url });
+            else if (wasSkipped) skipped.push(url);
+          }
+        }
+        return { updates, checked, skipped };
+      };
+
+      keepAliveWhile(task().then(respond).catch(respondErr));
+      return true;
+    }
+
+    // Force re-download one cached artifact (unconditional GET + SHA gate).
+    if (msg.type === "UPDATE_CACHED_MODEL") {
+      const task = async () => {
+        const { cacheName, url } = msg.data ?? {};
+        if (!cacheName || !url) throw new Error("Invalid update request payload");
+        await forceRefreshArtifact(cacheName, url);
+        return { success: true };
+      };
+
+      keepAliveWhile(task().then(respond).catch(respondErr));
+      return true;
+    }
+
+    // Delete a single cached model or file
+    if (msg.type === "DELETE_CACHED_MODEL") {
+      const task = async () => {
+        const { isLlm, modelId, cacheName, url } = msg.data;
+        if (isLlm && modelId) {
+          // Firefox has no offscreen API — skip WebLLM cache purge (no LLM
+          // weights exist there anyway); just prune the storage record.
+          if ((browser as any).offscreen) {
+            await ensureOffscreen();
+            await browser.runtime.sendMessage({
+              type: "OFFSCREEN_DELETE_LLM_CACHE",
+              data: { modelId },
+            });
+          }
+          const items = await storage.getItems(["local:cached-llms"]);
+          const cached = (items[0]?.value as string[]) || [];
+          await storage.setItem(
+            "local:cached-llms",
+            cached.filter((m) => m !== modelId),
+          );
+          return { success: true };
+        }
+
+        if (cacheName && url) {
+          const cache = await caches.open(cacheName);
+          await cache.delete(url);
+          const remaining = await cache.keys();
+          if (remaining.length === 0) {
+            await caches.delete(cacheName);
+          }
+          // A deleted weight must download from scratch next time: drop any
+          // retained partial and rewind jobs covering this file.
+          rewindManagedJobsForUrl(url);
+          return { success: true };
+        }
+
+        throw new Error("Invalid delete request payload");
+      };
+
+      keepAliveWhile(task().then(respond).catch(respondErr));
+      return true;
+    }
+
+    // Clear all cached models (CacheStorage + WebLLM)
+    if (msg.type === "CLEAR_ALL_CACHED_MODELS") {
+      const task = async () => {
+        const cacheNames = await caches.keys();
+        for (const name of cacheNames) {
+          await caches.delete(name).catch(() => {});
+        }
+        // All weights are gone: retained partials and job positions are void.
+        clearAllPartialDownloads();
+        for (const key of [...managedJobs.keys()]) discardManagedJob(key);
+
+        const items = await storage.getItems(["local:cached-llms"]);
+        const cachedLlms = (items[0]?.value as string[]) || [];
+        if (cachedLlms.length > 0) {
+          await ensureOffscreen().catch(() => {});
+          for (const modelId of cachedLlms) {
+            await browser.runtime.sendMessage({
+              type: "OFFSCREEN_DELETE_LLM_CACHE",
+              data: { modelId },
+            }).catch(() => {});
+          }
+          await storage.setItem("local:cached-llms", []);
+        }
+
+        return { success: true };
+      };
+
+      keepAliveWhile(task().then(respond).catch(respondErr));
+      return true;
+    }
+
+    // Delete a cached WebLLM model to free disk space
+    if (msg.type === "DELETE_LLM_CACHE") {
+      const forward = () =>
+        browser.runtime.sendMessage({
+          type: "OFFSCREEN_DELETE_LLM_CACHE",
+          data: { modelId: msg.data?.modelId },
+        });
+
+      const task = ensureOffscreen()
+        .then(forward)
+        .catch(async () => {
+          // Offscreen may be dead (e.g. CSP crash) - recreate and retry once.
+          await browser.offscreen.closeDocument().catch(() => {});
+          await ensureOffscreen();
+          return forward();
+        })
+        .then(async (res: any) => {
+          if (res?.error) throw new Error(res.error);
+          const items = await storage.getItems(["local:cached-llms"]);
+          const cached = (items[0].value as string[]) || [];
+          await storage.setItem(
+            "local:cached-llms",
+            cached.filter((m) => m !== msg.data?.modelId),
+          );
+          return { success: true };
+        });
+
+      keepAliveWhile(withTimeout(task, 60_000, "DELETE_LLM_CACHE").then(respond).catch(respondErr));
+
+      return true;
+    }
+
+    // Test the API Mode server connection
+    if (msg.type === "TEST_BACKEND") {
+      if (msg.data?.kind === "api") {
+        keepAliveWhile(
+          testServerConnection(msg.data.config)
+            .then(respond)
+            .catch(respondErr),
+        );
+      } else {
+        respond({ success: false, error: "Unknown backend kind" });
+      }
+
+      return true;
+    }
+
+    // Acked model download with progress (LMT-native, MIT-only)
+    // START_MODEL_DOWNLOAD {modelId, category} is the new explicit contract;
+    // PREFETCH_MODEL {type,data} remains as alias for legacy callers (Sidebar/Popup).
+    if (msg.type === "START_MODEL_DOWNLOAD") {
+      const { modelId, category } = msg.data ?? {};
+      const run = async () => {
+        if (!modelId) throw new Error("Missing modelId");
+        const cat = category ?? "ocr";
+        // Reuse PREFETCH_MODEL mapping
+        let prefetch: { type: string; data: string };
+        if (cat === "detection") prefetch = { type: "detection", data: modelId };
+        else if (cat === "inpaint") prefetch = { type: "inpaint", data: modelId };
+        else prefetch = { type: "ocr", data: modelId === "manga-ocr" || modelId === "ppocrv6-manga" || modelId === "pororo" ? modelId : modelId };
+        // Delegate to offscreen when possible, else direct download
+        try {
+          await ensureOffscreen();
+          const res = await browser.runtime.sendMessage({ type: "OFFSCREEN_PREFETCH_MODEL", data: prefetch });
+          if (res?.error) throw new Error(res.error);
+        } catch {
+          // Fallback: direct background download (CacheStorage accessible here)
+          const { type, data } = prefetch;
+          if (type === "inpaint") {
+            await downloadArtifactHF(DefaultConfig.lamaRepo, DefaultConfig.lamaModelPath, true);
+          } else if (type === "ocr") {
+            if (data === "manga-ocr") {
+              await Promise.all([
+                downloadArtifactHF(DefaultConfig.mangaOcrRepo, "encoder_model.onnx", true),
+                downloadArtifactHF(DefaultConfig.mangaOcrRepo, "decoder_model.onnx", true),
+                downloadArtifactHF(DefaultConfig.mangaOcrRepo, "vocab.txt", true),
+              ]);
+            } else if (data === "ppocrv6-manga") {
+              await downloadArtifactHF(env.ppocrv6MangaRepo, "ppocr-rec-v6-small-manga.onnx", true);
+            } else if (data === "pororo") {
+              await Promise.all([
+                downloadArtifactHF(env.pororoModelRepo, "brainocr.onnx", true),
+                downloadArtifactHF(env.pororoModelRepo, "ocr-opt.txt", true),
+              ]);
+            } else {
+              const raw = data && data !== "paddle" ? String(data) : "";
+              const lang = !raw ? "chinese" : (SUPPORTED_LANG_GROUPS as readonly string[]).includes(raw) ? raw : resolveLangGroup(raw).group;
+              await downloadArtifactHF(DefaultConfig.ocrRepo, DefaultConfig.ocrModelPath(lang), true);
+              await downloadArtifactHF(DefaultConfig.ocrRepo, DefaultConfig.ocrDictPath(lang), true);
+            }
+          } else if (type === "detection") {
+            const detId = normalizeDetectionModel(data);
+            if (detId === "comic-bubble") await downloadArtifactHF(DefaultConfig.rtdetrModelRepo, "detector-v4-s_int8.onnx", true);
+            else if (detId === "comic-text-detector") await downloadArtifactHF("direct-model-cache", DefaultConfig.comicTextDetectorUrl, true);
+            else throw new Error(UNKNOWN_DETECTION_MODEL_MESSAGE(detId));
+          }
+        }
+        return { success: true, status: "ready" as const, progress: 1 };
+      };
+      keepAliveWhile(
+        run()
+          .then((r) => {
+            // Best-effort broadcast to popups/sidebars
+            try {
+              browser.runtime.sendMessage({ type: "MODEL_DOWNLOAD_PROGRESS", payload: { modelId, progress: 1, status: "ready" } }).catch(() => {});
+            } catch {}
+            respond(r);
+          })
+          .catch(respondErr),
+      );
+      return true;
+    }
+
+    if (msg.type === "GPU_STATE_CHANGED") {
+      keepAliveWhile(
+        (async () => {
+          try {
+            await ensureOffscreen().catch(() => {});
+            await browser.runtime.sendMessage({ type: "OFFSCREEN_GPU_STATE_CHANGED", data: msg.data }).catch(() => {});
+          } catch {}
+          return { success: true };
+        })().then(respond).catch(respondErr),
+      );
+      return true;
+    }
+
+    if (msg.type === "CHECK_WEBGPU_SUPPORT") {
+      const task = (async () => {
+        try {
+          await ensureOffscreen();
+          const res = await browser.runtime.sendMessage({ type: "OFFSCREEN_CHECK_WEBGPU_SUPPORT", data: msg.data });
+          if (res && typeof res.supported === "boolean") return res;
+        } catch (err) {
+          console.warn("LMT: offscreen WebGPU probe failed, falling back to unsupported:", err);
+        }
+        // Fallback: no GPU in service worker context
+        return { supported: false };
+      })();
+      keepAliveWhile(task.then(respond).catch(respondErr));
+      return true;
+    }
+
+    if (msg.type === "GET_MODEL_STATUSES") {
+      const task = (async () => {
+        const ids: string[] = Array.isArray(msg.data?.modelIds) ? msg.data.modelIds : [];
+        // Best-effort: ask offscreen; fallback to local cache probes
+        try {
+          await ensureOffscreen();
+          const res = await browser.runtime.sendMessage({ type: "OFFSCREEN_GET_MODEL_STATUSES", data: { modelIds: ids } });
+          if (res?.statuses) return { success: true, statuses: res.statuses, downloads: res.downloads ?? {} };
+        } catch (err) {
+          console.warn("LMT: offscreen model-status probe failed:", err);
+        }
+        return { success: true, statuses: {}, downloads: {} };
+      })();
+      keepAliveWhile(task.then(respond).catch(respondErr));
+      return true;
+    }
+
+    // Real WebLLM weight presence via offscreen `hasModelInCache`.
+    // `local:cached-llms` alone is stale-prone (written once at setup
+    // download, never re-validated). Callers intersect list ∩ probe.
+    if (msg.type === "LLM_CACHE_STATUS") {
+      const task = (async () => {
+        const ids: string[] = Array.isArray(msg.data?.modelIds) ? msg.data.modelIds : [];
+        try {
+          await ensureOffscreen();
+          const res = await browser.runtime.sendMessage({ type: "OFFSCREEN_LLM_CACHE_STATUS", data: { modelIds: ids } });
+          if (res?.statuses) return { success: true, statuses: res.statuses };
+          if (res?.error) throw new Error(res.error);
+        } catch (err) {
+          return { success: false, error: (err as Error)?.message ?? String(err) };
+        }
+        const empty: Record<string, boolean> = {};
+        for (const id of ids) empty[id] = false;
+        return { success: true, statuses: empty };
+      })();
+      keepAliveWhile(task.then(respond).catch(respondErr));
+      return true;
+    }
+
+    // Central resumable downloads, shared by setup wizard / popup / sidebar.
+    // One single-button toggle per UI: Download ⇄ Pause, Resume when paused.
+    if (msg.type === "DOWNLOAD_START") {
+      const { key, files } = msg.data ?? {};
+      const task = async () => {
+        if (!key || !Array.isArray(files) || files.length === 0) {
+          throw new Error("DOWNLOAD_START needs {key, files[]}");
+        }
+        return { success: true, snapshot: await startManagedJob(key, files) };
+      };
+      keepAliveWhile(task().then(respond).catch(respondErr));
+      return true;
+    }
+
+    if (msg.type === "DOWNLOAD_PAUSE") {
+      const { key } = msg.data ?? {};
+      if (key) pauseManagedJob(key);
+      const job = key ? managedJobs.get(key) : undefined;
+      respond({ success: true, snapshot: job ? managedSnapshot(job) : null });
+      return true;
+    }
+
+    if (msg.type === "DOWNLOAD_DISCARD") {
+      const { key } = msg.data ?? {};
+      if (key) discardManagedJob(key);
+      respond({ success: true });
+      return true;
+    }
+
+    if (msg.type === "GET_ACTIVE_DOWNLOADS") {
+      const downloads: Record<string, unknown> = {};
+      for (const [key, job] of managedJobs) downloads[key] = managedSnapshot(job);
+      respond({ success: true, downloads });
+      return true;
+    }
+
+    // Caching model when user changes specific settings
+    if (msg.type === "PREFETCH_MODEL") {
+      const { type, data } = msg.data;
+
+      const runPrefetch = async () => {
+        if (type === "inpaint") {
+          await downloadArtifactHF(
+            DefaultConfig.lamaRepo,
+            DefaultConfig.lamaModelPath,
+            true,
+          );
+        } else if (type === "ocr") {
+          if (data === "manga-ocr") {
+            await Promise.all([
+              downloadArtifactHF(DefaultConfig.mangaOcrRepo, "encoder_model.onnx", true),
+              downloadArtifactHF(DefaultConfig.mangaOcrRepo, "decoder_model.onnx", true),
+              downloadArtifactHF(DefaultConfig.mangaOcrRepo, "vocab.txt", true),
+            ]);
+          } else if (data === "ppocrv6-manga") {
+            // Fixed-file engine with a bundled dict — onnx only.
+            await downloadArtifactHF(env.ppocrv6MangaRepo, "ppocr-rec-v6-small-manga.onnx", true);
+          } else if (data === "pororo") {
+            await Promise.all([
+              downloadArtifactHF(env.pororoModelRepo, "brainocr.onnx", true),
+              downloadArtifactHF(env.pororoModelRepo, "ocr-opt.txt", true),
+            ]);
+          } else {
+            // `data` is usually a resolved lang group from the popup; accept a
+            // language name too. Missing/unknown stays "chinese" (CJK focus).
+            const raw = data && data !== "paddle" ? String(data) : "";
+            const lang = !raw
+              ? "chinese"
+              : (SUPPORTED_LANG_GROUPS as readonly string[]).includes(raw)
+                ? raw
+                : resolveLangGroup(raw).group;
+            await downloadArtifactHF(DefaultConfig.ocrRepo, DefaultConfig.ocrModelPath(lang), true);
+            await downloadArtifactHF(DefaultConfig.ocrRepo, DefaultConfig.ocrDictPath(lang), true);
+          }
+        } else if (type === "detection") {
+          const detId = normalizeDetectionModel(data);
+          if (detId === "comic-bubble") {
+            await downloadArtifactHF(DefaultConfig.rtdetrModelRepo, "detector-v4-s_int8.onnx", true);
+          } else if (detId === "comic-text-detector") {
+            await downloadArtifactHF(
+              "direct-model-cache",
+              DefaultConfig.comicTextDetectorUrl,
+              true,
+            );
+          } else {
+            throw new Error(UNKNOWN_DETECTION_MODEL_MESSAGE(detId));
+          }
+        }
+        return { success: true };
+      };
+
+      keepAliveWhile(runPrefetch().then(respond).catch(respondErr));
+
+      return true;
+    }
+  });
+});
